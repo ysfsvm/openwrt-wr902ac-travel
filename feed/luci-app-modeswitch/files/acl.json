@@ -1,0 +1,46 @@
+{
+	"luci-app-modeswitch": {
+		"description": "Grant access to the hardware mode switch profiles",
+		"read": {
+			"file": {
+				"/usr/sbin/modectl status --json": [
+					"exec"
+				],
+				"/etc/config/network": [
+					"read"
+				],
+				"/etc/config/wireless": [
+					"read"
+				],
+				"/etc/config/firewall": [
+					"read"
+				],
+				"/etc/config/dhcp": [
+					"read"
+				],
+				"/etc/modes/*/*": [
+					"read"
+				],
+				"/usr/sbin/modectl brief": [
+					"exec"
+				]
+			},
+			"uci": [
+				"modeswitch"
+			]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/modectl *": [
+					"exec"
+				],
+				"/tmp/modeswitch-edit/*": [
+					"write"
+				]
+			},
+			"uci": [
+				"modeswitch"
+			]
+		}
+	}
+}

@@ -1,0 +1,14 @@
+{
+	"admin/system/modeswitch": {
+		"title": "Mode Switch",
+		"order": 15,
+		"action": {
+			"type": "view",
+			"path": "modeswitch"
+		},
+		"depends": {
+			"acl": [ "luci-app-modeswitch" ],
+			"uci": { "modeswitch": true }
+		}
+	}
+}
