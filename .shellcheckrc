@@ -1,0 +1,2 @@
+# OpenWrt's /bin/sh is busybox ash
+shell=busybox
