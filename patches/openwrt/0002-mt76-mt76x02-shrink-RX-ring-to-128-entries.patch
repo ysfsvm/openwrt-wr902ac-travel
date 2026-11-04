@@ -1,0 +1,44 @@
+From 920a66c5f4332da78eb1586d791044f25b8356eb Mon Sep 17 00:00:00 2001
+From: retake <ysfss@protonmail.com>
+Date: Tue, 3 Nov 2026 12:00:02 +0300
+Subject: [PATCH 2/7] mt76: mt76x02: shrink RX ring to 128 entries
+
+Saves 256 KiB of pinned page_pool buffers per MT76x0E/MT76x2 radio
+(MT7610E on the TL-WR902AC v3).  The 5 GHz radio of the test device is
+disabled in its configuration, so the throughput impact is not measured.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: retake <ysfss@protonmail.com>
+---
+ .../patches/990-mt76x02-shrink-rx-ring.patch  | 22 +++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+ create mode 100644 package/kernel/mt76/patches/990-mt76x02-shrink-rx-ring.patch
+
+diff --git a/package/kernel/mt76/patches/990-mt76x02-shrink-rx-ring.patch b/package/kernel/mt76/patches/990-mt76x02-shrink-rx-ring.patch
+new file mode 100644
+index 0000000..4888b43
+--- /dev/null
++++ b/package/kernel/mt76/patches/990-mt76x02-shrink-rx-ring.patch
+@@ -0,0 +1,22 @@
++From: retake <ysfss@protonmail.com>
++Subject: [PATCH] wifi: mt76: mt76x02: shrink RX ring from 256 to 128
++
++Each RX entry pins a 2 KiB page_pool buffer.  On 64 MiB boards, 128
++entries save 256 KiB.
++
++Assisted-by: Claude:claude-opus-5-5
++Signed-off-by: retake <ysfss@protonmail.com>
++---
++diff --git a/mt76x02_dma.h b/mt76x02_dma.h
++index 2f6ba8c..0dc1cdc 100644
++--- a/mt76x02_dma.h
+++++ b/mt76x02_dma.h
++@@ -38,7 +38,7 @@
++ #define MT_MCU_MSG_TYPE_CMD		BIT(30)
++ 
++ #define MT_RX_HEADROOM			32
++-#define MT76X02_RX_RING_SIZE		256
+++#define MT76X02_RX_RING_SIZE		128
++ 
++ enum dma_msg_port {
++ 	WLAN_PORT,
