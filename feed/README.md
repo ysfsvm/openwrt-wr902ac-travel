@@ -65,6 +65,10 @@ role for the wired port:
   that could cut the browser off and roll the change back.  The check runs
   once the apply is confirmed or rolled back.
 - Uncommitted `network` changes block the move; this is logged.
+- While the Wi-Fi uplink is configured but out of range, OpenWrt does not
+  start the AP on the same radio (it waits for the STA's channel).  The
+  wired port is LAN then, so the device stays reachable by cable.  Disable
+  the uplink when leaving its network.
 
 ## modectl
 
