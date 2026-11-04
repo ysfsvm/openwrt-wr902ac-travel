@@ -1,0 +1,12 @@
+#!/bin/sh
+# This build has no IPv6 userspace (odhcpd/odhcp6c): drop wan6, ULA, ip6assign and DHCPv6/RA settings
+uci -q delete network.wan6
+uci -q delete network.globals.ula_prefix
+for s in $(uci -q show network | sed -n "s/^network\.\([^.]*\)\.ip6assign=.*/\1/p"); do uci -q delete "network.$s.ip6assign"; done
+uci -q delete dhcp.odhcpd
+for s in $(uci -q show dhcp | sed -n "s/^dhcp\.\([^.]*\)=dhcp$/\1/p"); do
+	for o in dhcpv6 ra ra_flags ra_slaac ndp; do uci -q delete "dhcp.$s.$o"; done
+done
+uci commit network
+uci commit dhcp
+exit 0
