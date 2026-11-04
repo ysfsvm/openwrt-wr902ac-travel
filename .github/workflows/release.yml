@@ -70,5 +70,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release/* \
-            --title "$GITHUB_REF_NAME" --notes-file <(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
+          # checkout leaves the tag pointing at the commit; fetch the tag
+          # object for its message, without the signature
+          git fetch --no-tags --depth=1 origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git tag -l --format='%(contents:subject)%0a%0a%(contents:body)' "$GITHUB_REF_NAME" > notes
+          gh release create "$GITHUB_REF_NAME" release/* --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes-file notes
