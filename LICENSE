@@ -1,0 +1,22 @@
+wr902ac-openwrt-debloat licensing
+=================================
+
+SPDX-License-Identifier: GPL-2.0-or-later
+
+Unless a file says otherwise, the contents of this repository (OpenWrt
+package Makefiles, init and helper scripts, UCI defaults, LuCI views, the
+build, lint and test scripts) are licensed under the GNU General Public
+License, version 2 or (at your option) any later version.  The full text
+of version 2 is in COPYING.
+
+Documentation (the README.md files and docs/) is licensed under the
+Creative Commons Attribution 4.0 International licence (CC-BY-4.0).
+
+Exceptions
+----------
+
+- patches/openwrt: changes to the OpenWrt build system and to the
+  packages, kernel files and backported upstream patches it carries.  Each
+  change is distributed under the licence of the files it modifies
+  (OpenWrt: GPL-2.0-only unless a file says otherwise; Linux and mt76:
+  their own licences).

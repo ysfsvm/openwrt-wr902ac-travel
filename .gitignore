@@ -1,0 +1,4 @@
+# default OpenWrt tree of scripts/build.sh, build output
+/openwrt/
+/out/
+/release/
