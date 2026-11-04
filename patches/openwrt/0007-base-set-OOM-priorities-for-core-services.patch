@@ -1,0 +1,106 @@
+From 08b0220ce509a572502c4c55b93b4f8d19790c7a Mon Sep 17 00:00:00 2001
+From: retake <ysfss@protonmail.com>
+Date: Tue, 3 Nov 2026 12:00:07 +0300
+Subject: [PATCH 7/7] base: set OOM priorities for core services
+
+On a TL-WR902AC v3 (64 MiB), a 92 Mbit/s UDP flood made the OOM killer
+kill collectd, then hostapd (Wi-Fi down), then rpcd.  Protect the
+services that keep the device reachable and let the web UI go first:
+
+  -900 hostapd, wpa_supplicant, netifd, dropbear
+  -500 dnsmasq
+  +500 uhttpd, rpcd
+
+Requires procd_set_param oom_score_adj.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: retake <ysfss@protonmail.com>
+---
+ package/network/config/netifd/files/etc/init.d/network | 1 +
+ package/network/services/dnsmasq/files/dnsmasq.init    | 1 +
+ package/network/services/dropbear/files/dropbear.init  | 1 +
+ package/network/services/hostapd/files/wpad.init       | 2 ++
+ package/network/services/uhttpd/files/uhttpd.init      | 1 +
+ package/system/rpcd/files/rpcd.init                    | 1 +
+ 6 files changed, 7 insertions(+)
+
+diff --git a/package/network/config/netifd/files/etc/init.d/network b/package/network/config/netifd/files/etc/init.d/network
+index b8b2a21..4ec372a 100755
+--- a/package/network/config/netifd/files/etc/init.d/network
++++ b/package/network/config/netifd/files/etc/init.d/network
+@@ -22,6 +22,7 @@ start_service() {
+ 	[ -e /proc/sys/kernel/core_pattern ] && {
+ 		procd_set_param limits core="unlimited"
+ 	}
++	procd_set_param oom_score_adj -900
+ 	procd_close_instance
+ }
+ 
+diff --git a/package/network/services/dnsmasq/files/dnsmasq.init b/package/network/services/dnsmasq/files/dnsmasq.init
+index 61dc396..01c958d 100755
+--- a/package/network/services/dnsmasq/files/dnsmasq.init
++++ b/package/network/services/dnsmasq/files/dnsmasq.init
+@@ -1286,6 +1286,7 @@ dnsmasq_start()
+ 	esac
+ 	[ -e "$hostsfile" ] && procd_add_jail_mount $hostsfile
+ 
++	procd_set_param oom_score_adj -500
+ 	procd_close_instance
+ }
+ 
+diff --git a/package/network/services/dropbear/files/dropbear.init b/package/network/services/dropbear/files/dropbear.init
+index d5eb44b..95c1bff 100755
+--- a/package/network/services/dropbear/files/dropbear.init
++++ b/package/network/services/dropbear/files/dropbear.init
+@@ -357,6 +357,7 @@ dropbear_instance()
+ 	}
+ 	[ "${mdns}" -ne 0 ] && procd_add_mdns "ssh" "tcp" "$Port" "daemon=dropbear"
+ 	procd_set_param respawn
++	procd_set_param oom_score_adj -900
+ 	procd_close_instance
+ }
+ 
+diff --git a/package/network/services/hostapd/files/wpad.init b/package/network/services/hostapd/files/wpad.init
+index 65d46df..7a3b654 100644
+--- a/package/network/services/hostapd/files/wpad.init
++++ b/package/network/services/hostapd/files/wpad.init
+@@ -21,6 +21,7 @@ start_service() {
+ 			procd_set_param group network
+ 			procd_set_param no_new_privs 1
+ 		}
++		procd_set_param oom_score_adj -900
+ 		procd_close_instance
+ 	fi
+ 
+@@ -38,6 +39,7 @@ start_service() {
+ 			procd_set_param group network
+ 			procd_set_param no_new_privs 1
+ 		}
++		procd_set_param oom_score_adj -900
+ 		procd_close_instance
+ 	fi
+ }
+diff --git a/package/network/services/uhttpd/files/uhttpd.init b/package/network/services/uhttpd/files/uhttpd.init
+index c6e0b21..a9bfd3b 100755
+--- a/package/network/services/uhttpd/files/uhttpd.init
++++ b/package/network/services/uhttpd/files/uhttpd.init
+@@ -220,6 +220,7 @@ start_instance()
+ 		[ -s "$file" ] && procd_append_param command -H "$file"
+ 	done
+ 
++	procd_set_param oom_score_adj 500
+ 	procd_close_instance
+ }
+ 
+diff --git a/package/system/rpcd/files/rpcd.init b/package/system/rpcd/files/rpcd.init
+index f75d0e0..dc00322 100755
+--- a/package/system/rpcd/files/rpcd.init
++++ b/package/system/rpcd/files/rpcd.init
+@@ -13,6 +13,7 @@ start_service() {
+ 	procd_open_instance
+ 	procd_set_param command "$PROG" ${socket:+-s "$socket"} ${timeout:+-t "$timeout"}
+ 	procd_set_param respawn
++	procd_set_param oom_score_adj 500
+ 	procd_close_instance
+ }
+ 
