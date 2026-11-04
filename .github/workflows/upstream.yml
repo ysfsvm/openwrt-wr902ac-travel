@@ -1,0 +1,56 @@
+name: upstream
+
+# Weekly: does the patch series still apply to the newest OpenWrt release
+# of the pinned branch?  Opens an issue when a newer release exists or the
+# patches stop applying.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: newest release of the pinned branch
+        id: newest
+        run: |
+          pinned=$(cat config/openwrt-version)
+          branch=${pinned%.*}
+          newest=$(git ls-remote --tags --refs https://github.com/openwrt/openwrt.git "refs/tags/${branch}.*" \
+            | sed 's|.*refs/tags/||' | grep -E "^${branch//./\\.}\.[0-9]+$" | sort -V | tail -n1)
+          echo "pinned=$pinned newest=$newest"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "newest=$newest" >> "$GITHUB_OUTPUT"
+
+      - name: apply the patches to it
+        id: apply
+        if: steps.newest.outputs.newest != steps.newest.outputs.pinned
+        run: |
+          git clone -q --depth 1 --branch "${{ steps.newest.outputs.newest }}" https://github.com/openwrt/openwrt.git openwrt
+          if git -C openwrt -c user.name=ci -c user.email=ci@localhost am patches/openwrt/*.patch; then
+            echo "result=applies" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fails" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: open an issue
+        if: steps.newest.outputs.newest != steps.newest.outputs.pinned
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEWEST: ${{ steps.newest.outputs.newest }}
+          PINNED: ${{ steps.newest.outputs.pinned }}
+          RESULT: ${{ steps.apply.outputs.result }}
+        run: |
+          title="OpenWrt $NEWEST is out (pinned: $PINNED)"
+          if gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number' | grep -q .; then
+            exit 0
+          fi
+          gh issue create --title "$title" --body "patches/openwrt: $RESULT on $NEWEST."

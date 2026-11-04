@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck, JavaScript, JSON
+        run: ENGINE=docker scripts/lint.sh
+
+  patches:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: apply patches/openwrt to the pinned OpenWrt release
+        run: |
+          ref=$(cat config/openwrt-version)
+          git clone -q --depth 1 --branch "$ref" https://github.com/openwrt/openwrt.git openwrt
+          git -C openwrt -c user.name=ci -c user.email=ci@localhost am patches/openwrt/*.patch
+          git -C openwrt log --oneline "$ref..HEAD"
+
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: modectl tests in an OpenWrt rootfs
+        run: |
+          IMAGE="docker.io/openwrt/rootfs:x86-64-$(cat config/openwrt-version)" \
+          ENGINE=docker tests/run.sh
+
+  packages:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the feed packages with the OpenWrt SDK
+        run: |
+          mkdir -m 0777 out
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" \
+            "ghcr.io/openwrt/sdk:ramips-mt76x8-$(cat config/openwrt-version)" \
+            bash /src/scripts/sdk-packages.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: out/*.apk
