@@ -23,7 +23,7 @@ jobs:
         run: |
           ref=$(cat config/openwrt-version)
           git clone -q --depth 1 --branch "$ref" https://github.com/openwrt/openwrt.git openwrt
-          git -C openwrt -c user.name=ci -c user.email=ci@localhost am patches/openwrt/*.patch
+          git -C openwrt -c user.name=ci -c user.email=ci@localhost am "$GITHUB_WORKSPACE"/patches/openwrt/*.patch
           git -C openwrt log --oneline "$ref..HEAD"
 
   tests:

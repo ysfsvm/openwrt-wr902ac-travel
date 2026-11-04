@@ -35,7 +35,7 @@ jobs:
         if: steps.newest.outputs.newest != steps.newest.outputs.pinned
         run: |
           git clone -q --depth 1 --branch "${{ steps.newest.outputs.newest }}" https://github.com/openwrt/openwrt.git openwrt
-          if git -C openwrt -c user.name=ci -c user.email=ci@localhost am patches/openwrt/*.patch; then
+          if git -C openwrt -c user.name=ci -c user.email=ci@localhost am "$GITHUB_WORKSPACE"/patches/openwrt/*.patch; then
             echo "result=applies" >> "$GITHUB_OUTPUT"
           else
             echo "result=fails" >> "$GITHUB_OUTPUT"
