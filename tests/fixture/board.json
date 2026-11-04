@@ -1,0 +1,25 @@
+{
+	"model": {
+		"id": "tplink,tl-wr902ac-v3",
+		"name": "TP-Link TL-WR902AC v3"
+	},
+	"network": {
+		"lan": {
+			"device": "eth0.1",
+			"protocol": "static"
+		}
+	},
+	"switch": {
+		"switch0": {
+			"enable": true,
+			"reset": true,
+			"ports": [
+				{ "num": 4, "role": "lan" },
+				{ "num": 6, "device": "eth0", "need_tag": false, "want_untag": false }
+			],
+			"roles": [
+				{ "role": "lan", "ports": "4 6t", "device": "eth0.1" }
+			]
+		}
+	}
+}
