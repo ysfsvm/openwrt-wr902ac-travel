@@ -1,0 +1,27 @@
+From 1913aac4c398db582569507f31f8fadf6e087d87 Mon Sep 17 00:00:00 2001
+From: retake <ysfss@protonmail.com>
+Date: Tue, 3 Nov 2026 12:00:04 +0300
+Subject: [PATCH 4/7] ramips: mt76x8: shrink printk ring buffer to 16 KiB
+
+The generic config uses LOG_BUF_SHIFT=17, 128 KiB of static .bss.  logd
+copies kernel messages into its own buffer, so 16 KiB is enough on
+64 MiB boards.  Saves 112 KiB.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: retake <ysfss@protonmail.com>
+---
+ target/linux/ramips/mt76x8/config-6.12 | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/target/linux/ramips/mt76x8/config-6.12 b/target/linux/ramips/mt76x8/config-6.12
+index b3014c0..6be910f 100644
+--- a/target/linux/ramips/mt76x8/config-6.12
++++ b/target/linux/ramips/mt76x8/config-6.12
+@@ -99,6 +99,7 @@ CONFIG_IRQ_MIPS_CPU=y
+ CONFIG_IRQ_WORK=y
+ CONFIG_LIBFDT=y
+ CONFIG_LOCK_DEBUGGING_SUPPORT=y
++CONFIG_LOG_BUF_SHIFT=14
+ CONFIG_MDIO_BUS=y
+ CONFIG_MDIO_DEVICE=y
+ CONFIG_MDIO_DEVRES=y
