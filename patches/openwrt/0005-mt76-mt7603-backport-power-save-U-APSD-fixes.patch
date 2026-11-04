@@ -1,0 +1,642 @@
+From 8ec39b8887c03014168c3d9ed83cc2a2e34ec699 Mon Sep 17 00:00:00 2001
+From: retake <ysfss@protonmail.com>
+Date: Tue, 3 Nov 2026 12:00:05 +0300
+Subject: [PATCH 5/7] mt76: mt7603: backport power-save/U-APSD fixes
+
+Backport of openwrt/mt76 commits baac541c0524, 56fe4e0c0aea,
+276db249c20a, 5504bac46a38, c50f17ec046e and a374cac12909 (2026-08/09).
+They fix Wi-Fi freezes with power-saving clients on MT7628/mt7603
+(mt76 #1080).  All six apply on top of the 25.12.6 mt76 package patches,
+and the mac80211 symbols they use exist in backports 6.18.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: retake <ysfss@protonmail.com>
+---
+ ...-fix-U-APSD-service-period-terminati.patch | 144 +++++++++++++
+ ...-tell-mac80211-when-the-PS-queue-has.patch |  56 ++++++
+ ...-restore-hardware-PS-buffering-after.patch | 190 ++++++++++++++++++
+ ...-file-buffered-frames-under-the-TID-.patch |  46 +++++
+ ...t7603-initialize-global-station-WCID.patch |  50 +++++
+ ...-don-t-drop-short-frames-looped-back.patch |  92 +++++++++
+ 6 files changed, 578 insertions(+)
+ create mode 100644 package/kernel/mt76/patches/0991-wifi-mt76-mt7603-fix-U-APSD-service-period-terminati.patch
+ create mode 100644 package/kernel/mt76/patches/0992-wifi-mt76-mt7603-tell-mac80211-when-the-PS-queue-has.patch
+ create mode 100644 package/kernel/mt76/patches/0993-wifi-mt76-mt7603-restore-hardware-PS-buffering-after.patch
+ create mode 100644 package/kernel/mt76/patches/0994-wifi-mt76-mt7603-file-buffered-frames-under-the-TID-.patch
+ create mode 100644 package/kernel/mt76/patches/0995-wifi-mt76-mt7603-initialize-global-station-WCID.patch
+ create mode 100644 package/kernel/mt76/patches/0996-wifi-mt76-mt7603-don-t-drop-short-frames-looped-back.patch
+
+diff --git a/package/kernel/mt76/patches/0991-wifi-mt76-mt7603-fix-U-APSD-service-period-terminati.patch b/package/kernel/mt76/patches/0991-wifi-mt76-mt7603-fix-U-APSD-service-period-terminati.patch
+new file mode 100644
+index 0000000..772e9c7
+--- /dev/null
++++ b/package/kernel/mt76/patches/0991-wifi-mt76-mt7603-fix-U-APSD-service-period-terminati.patch
+@@ -0,0 +1,144 @@
++From ca09cf87dec2177d222b0cc03de6042f5eb8ee77 Mon Sep 17 00:00:00 2001
++From: Felix Fietkau <nbd@nbd.name>
++Date: Sat, 1 Aug 2026 14:53:29 +0000
++Subject: [PATCH 991/996] wifi: mt76: mt7603: fix U-APSD service period
++ termination
++
++Frames released from the driver PS queue were all tagged with MORE_DATA
++and none of them ever carried the EOSP bit, so from the client's point of
++view a U-APSD service period was started but never finished. Clients that
++keep their receiver on until EOSP arrives stop sending trigger frames,
++and all downlink traffic for that station stalls until they give up.
++ieee80211_sta_eosp() only cleared the service period state inside
++mac80211, which is why the mismatch went unnoticed.
++
++Assign MORE_DATA per frame and set the wire EOSP bit on the last one. If
++the last released frame is a bufferable MMPDU it has no QoS control field
++to carry EOSP, so let mac80211 append a QoS-Null frame instead.
++
++Also stop handing the remaining frame budget to
++mt76_release_buffered_frames() once frames have been released from the PS
++queue: both would signal the end of the same service period. Releasing
++fewer frames than requested is allowed, and MORE_DATA tells the client to
++trigger again.
++
++Link: https://patch.msgid.link/20260801145334.1166751-5-nbd@nbd.name
++Signed-off-by: Felix Fietkau <nbd@nbd.name>
++(cherry picked from commit baac541c0524b7056dd618671f966fff5ad596b7)
++---
++ mt7603/main.c | 74 +++++++++++++++++++++++++++++++++++++++++++--------
++ 1 file changed, 63 insertions(+), 11 deletions(-)
++
++diff --git a/mt7603/main.c b/mt7603/main.c
++index 0f3a7508..7c231995 100644
++--- a/mt7603/main.c
+++++ b/mt7603/main.c
++@@ -423,13 +423,33 @@ mt7603_sta_ps(struct mt76_dev *mdev, struct ieee80211_sta *sta, bool ps)
++ 	mt7603_ps_tx_list(dev, &list);
++ }
++ 
+++static struct ieee80211_hdr *
+++mt7603_ps_skb_hdr(struct sk_buff *skb)
+++{
+++	return (struct ieee80211_hdr *)&skb->data[MT_TXD_SIZE];
+++}
+++
+++/*
+++ * Buffered frames can be recycled into the PS queue by mt7603_filter_tx(), so
+++ * both bits have to be assigned, not just set.
+++ */
++ static void
++-mt7603_ps_set_more_data(struct sk_buff *skb)
+++mt7603_ps_set_flags(struct sk_buff *skb, bool more_data, bool eosp)
++ {
++-	struct ieee80211_hdr *hdr;
+++	struct ieee80211_hdr *hdr = mt7603_ps_skb_hdr(skb);
+++
+++	if (more_data)
+++		hdr->frame_control |= cpu_to_le16(IEEE80211_FCTL_MOREDATA);
+++	else
+++		hdr->frame_control &= ~cpu_to_le16(IEEE80211_FCTL_MOREDATA);
+++
+++	if (!ieee80211_is_data_qos(hdr->frame_control))
+++		return;
++ 
++-	hdr = (struct ieee80211_hdr *)&skb->data[MT_TXD_SIZE];
++-	hdr->frame_control |= cpu_to_le16(IEEE80211_FCTL_MOREDATA);
+++	if (eosp)
+++		*ieee80211_get_qos_ctl(hdr) |= IEEE80211_QOS_CTL_EOSP;
+++	else
+++		*ieee80211_get_qos_ctl(hdr) &= ~IEEE80211_QOS_CTL_EOSP;
++ }
++ 
++ static void
++@@ -442,7 +462,10 @@ mt7603_release_buffered_frames(struct ieee80211_hw *hw,
++ 	struct mt7603_dev *dev = hw->priv;
++ 	struct mt7603_sta *msta = (struct mt7603_sta *)sta->drv_priv;
++ 	struct sk_buff_head list;
++-	struct sk_buff *skb, *tmp;
+++	struct sk_buff *skb, *tmp, *last;
+++	bool eosp_null, uapsd;
+++	u16 pending = 0;
+++	u8 last_tid;
++ 
++ 	__skb_queue_head_init(&list);
++ 
++@@ -458,20 +481,49 @@ mt7603_release_buffered_frames(struct ieee80211_hw *hw,
++ 
++ 		skb_set_queue_mapping(skb, MT_TXQ_PSD);
++ 		__skb_unlink(skb, &msta->psq);
++-		mt7603_ps_set_more_data(skb);
++ 		__skb_queue_tail(&list, skb);
++ 		nframes--;
++ 	}
+++
+++	skb_queue_walk(&msta->psq, skb)
+++		pending |= BIT(skb->priority);
++ 	spin_unlock_bh(&dev->ps_lock);
++ 
++-	if (!skb_queue_empty(&list))
++-		ieee80211_sta_eosp(sta);
+++	last = skb_peek_tail(&list);
+++	if (!last) {
+++		mt76_release_buffered_frames(hw, sta, tids, nframes, reason,
+++					     more_data);
+++		return;
+++	}
+++
+++	/*
+++	 * End the service period here instead of passing the remaining frame
+++	 * budget on to mt76_release_buffered_frames(), which would signal the
+++	 * end of the same service period a second time.
+++	 */
+++	uapsd = reason == IEEE80211_FRAME_RELEASE_UAPSD;
+++	more_data |= !!(pending & tids);
+++
+++	skb_queue_walk(&list, skb)
+++		mt7603_ps_set_flags(skb, skb != last || more_data,
+++				    skb == last && uapsd);
+++
+++	/*
+++	 * EOSP lives in the QoS control field, so a bufferable MMPDU cannot
+++	 * terminate a U-APSD service period on its own. In that case mac80211
+++	 * has to append a QoS-Null frame, which ends the SP through its tx
+++	 * status.
+++	 */
+++	eosp_null = uapsd &&
+++		    !ieee80211_is_data_qos(mt7603_ps_skb_hdr(last)->frame_control);
+++	last_tid = __fls(tids);
++ 
++ 	mt7603_ps_tx_list(dev, &list);
++ 
++-	if (nframes)
++-		mt76_release_buffered_frames(hw, sta, tids, nframes, reason,
++-					     more_data);
+++	if (eosp_null)
+++		ieee80211_send_eosp_nullfunc(sta, last_tid);
+++	else
+++		ieee80211_sta_eosp(sta);
++ }
++ 
++ static int
++-- 
++2.56.0
++
+diff --git a/package/kernel/mt76/patches/0992-wifi-mt76-mt7603-tell-mac80211-when-the-PS-queue-has.patch b/package/kernel/mt76/patches/0992-wifi-mt76-mt7603-tell-mac80211-when-the-PS-queue-has.patch
+new file mode 100644
+index 0000000..a21c5aa
+--- /dev/null
++++ b/package/kernel/mt76/patches/0992-wifi-mt76-mt7603-tell-mac80211-when-the-PS-queue-has.patch
+@@ -0,0 +1,56 @@
++From 52c0e89a2b054904c3b9b846ed921ed2615fb050 Mon Sep 17 00:00:00 2001
++From: Felix Fietkau <nbd@nbd.name>
++Date: Sat, 1 Aug 2026 14:53:30 +0000
++Subject: [PATCH 992/996] wifi: mt76: mt7603: tell mac80211 when the PS queue
++ has run empty
++
++mt7603_rx_loopback_skb() marks a TID as buffered when the hardware
++redirects a frame into the driver PS queue, but nothing ever clears that
++state again. mac80211 therefore keeps the TIM bit set for the station and
++keeps routing every service period to the driver, which also prevents it
++from releasing frames it has buffered itself.
++
++Clear the buffered state for every requested TID that has no frames left
++in the PS queue.
++
++Link: https://patch.msgid.link/20260801145334.1166751-6-nbd@nbd.name
++Signed-off-by: Felix Fietkau <nbd@nbd.name>
++(cherry picked from commit 56fe4e0c0aeade37173193071a8c16ced6535809)
++---
++ mt7603/main.c | 11 +++++++++++
++ 1 file changed, 11 insertions(+)
++
++diff --git a/mt7603/main.c b/mt7603/main.c
++index 7c231995..c968ee3d 100644
++--- a/mt7603/main.c
+++++ b/mt7603/main.c
++@@ -464,8 +464,10 @@ mt7603_release_buffered_frames(struct ieee80211_hw *hw,
++ 	struct sk_buff_head list;
++ 	struct sk_buff *skb, *tmp, *last;
++ 	bool eosp_null, uapsd;
+++	unsigned long drained;
++ 	u16 pending = 0;
++ 	u8 last_tid;
+++	int i;
++ 
++ 	__skb_queue_head_init(&list);
++ 
++@@ -489,6 +491,15 @@ mt7603_release_buffered_frames(struct ieee80211_hw *hw,
++ 		pending |= BIT(skb->priority);
++ 	spin_unlock_bh(&dev->ps_lock);
++ 
+++	/*
+++	 * Without this, mac80211 keeps the TIM bit set for the station and
+++	 * keeps routing every service period to the driver, even though there
+++	 * is nothing left to release.
+++	 */
+++	drained = tids & ~pending;
+++	for_each_set_bit(i, &drained, IEEE80211_NUM_TIDS)
+++		ieee80211_sta_set_buffered(sta, i, false);
+++
++ 	last = skb_peek_tail(&list);
++ 	if (!last) {
++ 		mt76_release_buffered_frames(hw, sta, tids, nframes, reason,
++-- 
++2.56.0
++
+diff --git a/package/kernel/mt76/patches/0993-wifi-mt76-mt7603-restore-hardware-PS-buffering-after.patch b/package/kernel/mt76/patches/0993-wifi-mt76-mt7603-restore-hardware-PS-buffering-after.patch
+new file mode 100644
+index 0000000..ce2091f
+--- /dev/null
++++ b/package/kernel/mt76/patches/0993-wifi-mt76-mt7603-restore-hardware-PS-buffering-after.patch
+@@ -0,0 +1,190 @@
++From 22cb4da51bfe7c96e555a3ff68c68bd5c4548c56 Mon Sep 17 00:00:00 2001
++From: Felix Fietkau <nbd@nbd.name>
++Date: Sat, 1 Aug 2026 14:53:31 +0000
++Subject: [PATCH 993/996] wifi: mt76: mt7603: restore hardware PS buffering
++ after a service period
++
++Releasing buffered frames has to turn off the PSE redirect for the
++station, otherwise the released frames are looped straight back into the
++driver PS queue. Nothing ever turns it back on: mt7603_sta_ps() only runs
++on an observed PM bit transition, and MT_WCID_FLAG_PS keeps mt76 from
++reporting the same state twice. After the first service period the
++hardware therefore treats a dozing station as awake and transmits at it
++directly, which is where the retry storms and the packet loss reported
++against U-APSD clients come from.
++
++Re-arm hardware buffering from mt7603_mac_work() for every station that
++is still known to be asleep, once the PSD queue has drained and the
++released frames have passed the redirect stage. Frames that are still
++queued belong to the service period that was just served, so unlike on a
++sleep transition they must not be pulled back with mt7603_filter_tx().
++
++Track the sleep state separately from the WTBL state, so a station that
++wakes up while the re-arm is pending is not put back to sleep.
++
++Link: https://patch.msgid.link/20260801145334.1166751-7-nbd@nbd.name
++Signed-off-by: Felix Fietkau <nbd@nbd.name>
++(cherry picked from commit 276db249c20a75b72514d3b9ee3824b76aa97b48)
++---
++ mt7603/mac.c    | 73 +++++++++++++++++++++++++++++++++++++++++++++----
++ mt7603/main.c   |  2 +-
++ mt7603/mt7603.h |  4 +++
++ 3 files changed, 72 insertions(+), 7 deletions(-)
++
++diff --git a/mt7603/mac.c b/mt7603/mac.c
++index d3110eeb..fa0bf9a2 100644
++--- a/mt7603/mac.c
+++++ b/mt7603/mac.c
++@@ -235,16 +235,17 @@ void mt7603_wtbl_set_smps(struct mt7603_dev *dev, struct mt7603_sta *sta,
++ 	sta->smps = enabled;
++ }
++ 
++-void mt7603_wtbl_set_ps(struct mt7603_dev *dev, struct mt7603_sta *sta,
++-			bool enabled)
+++static void
+++__mt7603_wtbl_set_ps(struct mt7603_dev *dev, struct mt7603_sta *sta,
+++		     bool enabled, bool filter)
++ {
++ 	int idx = sta->wcid.idx;
++ 	u32 addr;
++ 
++-	spin_lock_bh(&dev->ps_lock);
+++	lockdep_assert_held(&dev->ps_lock);
++ 
++ 	if (sta->ps == enabled)
++-		goto out;
+++		return;
++ 
++ 	mt76_wr(dev, MT_PSE_RTA,
++ 		FIELD_PREP(MT_PSE_RTA_TAG_ID, idx) |
++@@ -255,7 +256,7 @@ void mt7603_wtbl_set_ps(struct mt7603_dev *dev, struct mt7603_sta *sta,
++ 
++ 	mt76_poll(dev, MT_PSE_RTA, MT_PSE_RTA_BUSY, 0, 5000);
++ 
++-	if (enabled)
+++	if (enabled && filter)
++ 		mt7603_filter_tx(dev, sta->vif->idx, idx, false);
++ 
++ 	addr = mt7603_wtbl1_addr(idx);
++@@ -264,8 +265,34 @@ void mt7603_wtbl_set_ps(struct mt7603_dev *dev, struct mt7603_sta *sta,
++ 		 enabled * MT_WTBL1_W3_POWER_SAVE);
++ 	mt76_clear(dev, MT_WTBL1_OR, MT_WTBL1_OR_PSM_WRITE);
++ 	sta->ps = enabled;
+++}
++ 
++-out:
+++void mt7603_wtbl_set_ps(struct mt7603_dev *dev, struct mt7603_sta *sta,
+++			bool enabled)
+++{
+++	spin_lock_bh(&dev->ps_lock);
+++	__mt7603_wtbl_set_ps(dev, sta, enabled, enabled);
+++	spin_unlock_bh(&dev->ps_lock);
+++}
+++
+++void mt7603_wtbl_sta_ps(struct mt7603_dev *dev, struct mt7603_sta *sta, bool ps)
+++{
+++	spin_lock_bh(&dev->ps_lock);
+++	sta->ps_sleeping = ps;
+++	__mt7603_wtbl_set_ps(dev, sta, ps, ps);
+++	spin_unlock_bh(&dev->ps_lock);
+++}
+++
+++void mt7603_wtbl_restore_ps(struct mt7603_dev *dev, struct mt7603_sta *sta)
+++{
+++	spin_lock_bh(&dev->ps_lock);
+++	/*
+++	 * Frames that are already queued for the station belong to the service
+++	 * period that has just been served, so unlike on a sleep transition
+++	 * they must not be pulled back into the PS queue.
+++	 */
+++	if (sta->ps_sleeping)
+++		__mt7603_wtbl_set_ps(dev, sta, true, false);
++ 	spin_unlock_bh(&dev->ps_lock);
++ }
++ 
++@@ -1816,6 +1843,39 @@ out:
++ 	mt7603_adjust_sensitivity(dev);
++ }
++ 
+++/*
+++ * Releasing buffered frames turns off the PSE redirect for a station, since
+++ * the released frames would otherwise be looped back into the driver PS queue
+++ * again. mac80211 never tells us when the service period is over, so hardware
+++ * buffering has to be re-armed here for every station that is still known to
+++ * be asleep. Waiting for the PSD queue to drain makes sure that the released
+++ * frames have already passed the redirect stage.
+++ */
+++static void
+++mt7603_mac_ps_check(struct mt7603_dev *dev)
+++{
+++	int i;
+++
+++	if (dev->mphy.q_tx[MT_TXQ_PSD]->queued)
+++		return;
+++
+++	rcu_read_lock();
+++	for (i = 0; i < MT7603_WTBL_STA; i++) {
+++		struct mt76_wcid *wcid = mt76_wcid_ptr(dev, i);
+++		struct mt7603_sta *msta;
+++
+++		if (!wcid || !wcid->sta)
+++			continue;
+++
+++		msta = container_of(wcid, struct mt7603_sta, wcid);
+++		if (msta->ps || !msta->ps_sleeping)
+++			continue;
+++
+++		mt7603_wtbl_restore_ps(dev, msta);
+++	}
+++	rcu_read_unlock();
+++}
+++
++ void mt7603_mac_work(struct work_struct *work)
++ {
++ 	struct mt7603_dev *dev = container_of(work, struct mt7603_dev,
++@@ -1830,6 +1890,7 @@ void mt7603_mac_work(struct work_struct *work)
++ 	dev->mphy.mac_work_count++;
++ 	mt76_update_survey(&dev->mphy);
++ 	mt7603_edcca_check(dev);
+++	mt7603_mac_ps_check(dev);
++ 
++ 	for (i = 0, idx = 0; i < 2; i++) {
++ 		u32 val = mt76_rr(dev, MT_TX_AGG_CNT(i));
++diff --git a/mt7603/main.c b/mt7603/main.c
++index c968ee3d..757664e9 100644
++--- a/mt7603/main.c
+++++ b/mt7603/main.c
++@@ -410,7 +410,7 @@ mt7603_sta_ps(struct mt76_dev *mdev, struct ieee80211_sta *sta, bool ps)
++ 	struct sk_buff_head list;
++ 
++ 	mt76_stop_tx_queues(&dev->mphy, sta, true);
++-	mt7603_wtbl_set_ps(dev, msta, ps);
+++	mt7603_wtbl_sta_ps(dev, msta, ps);
++ 	if (ps)
++ 		return;
++ 
++diff --git a/mt7603/mt7603.h b/mt7603/mt7603.h
++index 071bfab3..5b0ecd01 100644
++--- a/mt7603/mt7603.h
+++++ b/mt7603/mt7603.h
++@@ -80,6 +80,7 @@ struct mt7603_sta {
++ 	u8 smps;
++ 
++ 	u8 ps;
+++	u8 ps_sleeping;
++ };
++ 
++ struct mt7603_vif {
++@@ -229,6 +230,9 @@ int mt7603_wtbl_set_key(struct mt7603_dev *dev, int wcid,
++ 			struct ieee80211_key_conf *key);
++ void mt7603_wtbl_set_ps(struct mt7603_dev *dev, struct mt7603_sta *sta,
++ 			bool enabled);
+++void mt7603_wtbl_sta_ps(struct mt7603_dev *dev, struct mt7603_sta *sta,
+++			bool ps);
+++void mt7603_wtbl_restore_ps(struct mt7603_dev *dev, struct mt7603_sta *sta);
++ void mt7603_wtbl_set_smps(struct mt7603_dev *dev, struct mt7603_sta *sta,
++ 			  bool enabled);
++ void mt7603_filter_tx(struct mt7603_dev *dev, int mac_idx, int idx, bool abort);
++-- 
++2.56.0
++
+diff --git a/package/kernel/mt76/patches/0994-wifi-mt76-mt7603-file-buffered-frames-under-the-TID-.patch b/package/kernel/mt76/patches/0994-wifi-mt76-mt7603-file-buffered-frames-under-the-TID-.patch
+new file mode 100644
+index 0000000..280ee63
+--- /dev/null
++++ b/package/kernel/mt76/patches/0994-wifi-mt76-mt7603-file-buffered-frames-under-the-TID-.patch
+@@ -0,0 +1,46 @@
++From e79783bc8b5d16aaf36bbe3b6ee5081d30e3eb3f Mon Sep 17 00:00:00 2001
++From: Felix Fietkau <nbd@nbd.name>
++Date: Sat, 1 Aug 2026 14:53:32 +0000
++Subject: [PATCH 994/996] wifi: mt76: mt7603: file buffered frames under the
++ TID reported to mac80211
++
++The PS queue filed redirected frames under the TID taken from the TXD,
++while mac80211 was told about the TID taken from the QoS header, or TID 0
++for anything that is not a QoS data frame. When the two disagree,
++mt7603_release_buffered_frames() skips the frame because it does not
++match the requested TIDs, so it stays in the PS queue until the station
++wakes up. Buffered MMPDUs hit this whenever they were sent on a
++non-zero TID.
++
++Use one TID for both.
++
++Link: https://patch.msgid.link/20260801145334.1166751-8-nbd@nbd.name
++Signed-off-by: Felix Fietkau <nbd@nbd.name>
++(cherry picked from commit 5504bac46a38d143e413a0362a4dfa46b66b5baf)
++---
++ mt7603/dma.c | 2 +-
++ 1 file changed, 1 insertion(+), 1 deletion(-)
++
++diff --git a/mt7603/dma.c b/mt7603/dma.c
++index 3a168515..477a9b7a 100644
++--- a/mt7603/dma.c
+++++ b/mt7603/dma.c
++@@ -39,7 +39,6 @@ mt7603_rx_loopback_skb(struct mt7603_dev *dev, struct sk_buff *skb)
++ 
++ 	val = le32_to_cpu(txd[1]);
++ 	idx = FIELD_GET(MT_TXD1_WLAN_IDX, val);
++-	skb->priority = FIELD_GET(MT_TXD1_TID, val);
++ 
++ 	if (idx >= MT7603_WTBL_STA - 1)
++ 		goto free;
++@@ -72,6 +71,7 @@ mt7603_rx_loopback_skb(struct mt7603_dev *dev, struct sk_buff *skb)
++ 		hwq = MT_TX_HW_QUEUE_MGMT;
++ 	}
++ 
+++	skb->priority = tid;
++ 	ieee80211_sta_set_buffered(sta, tid, true);
++ 
++ 	val = le32_to_cpu(txd[0]);
++-- 
++2.56.0
++
+diff --git a/package/kernel/mt76/patches/0995-wifi-mt76-mt7603-initialize-global-station-WCID.patch b/package/kernel/mt76/patches/0995-wifi-mt76-mt7603-initialize-global-station-WCID.patch
+new file mode 100644
+index 0000000..b1736af
+--- /dev/null
++++ b/package/kernel/mt76/patches/0995-wifi-mt76-mt7603-initialize-global-station-WCID.patch
+@@ -0,0 +1,50 @@
++From d43823212553a37a9d603b36c5e6b3cd00e76378 Mon Sep 17 00:00:00 2001
++From: Cristian Papa <pcristian292@gmail.com>
++Date: Thu, 3 Sep 2026 22:07:02 -0300
++Subject: [PATCH 995/996] wifi: mt76: mt7603: initialize global station WCID
++
++mt7603 uses a driver-private global station WCID for frames that have
++neither a station nor a vif, including frames injected through a monitor
++interface. Unlike the core global WCID initialized by
++mt76_register_device(), this WCID is published without ever being passed
++to mt76_wcid_init().
++
++Since commit 0335c034e726 ("wifi: mt76: fix race condition related to
++checking tx queue fill status"), mt76_tx() queues every such frame on the
++WCID's tx_pending or tx_offchannel queue and links its tx_list. The first
++injected frame therefore reaches __skb_queue_tail() with an uninitialized
++sk_buff_head and dereferences a NULL prev pointer.
++
++Initialize the WCID before publishing it.
++
++The fix was tested on an MT7603 PCIe device. Three wildcard probe requests
++were injected through a monitor interface. The hardware queue head and tail
++advanced from 0 to 3 and a second radio captured the third request over the
++air. No oops or reset occurred. After restoring AP mode, a 150 MB transfer
++also completed without a reset.
++
++Fixes: 0335c034e726 ("wifi: mt76: fix race condition related to checking tx queue fill status")
++Cc: stable@vger.kernel.org
++Signed-off-by: Cristian Papa <pcristian292@gmail.com>
++Link: https://patch.msgid.link/20260904010702.16306-1-pcristian292@gmail.com
++Signed-off-by: Felix Fietkau <nbd@nbd.name>
++(cherry picked from commit c50f17ec046e3df2574f7079859403df2cc13681)
++---
++ mt7603/init.c | 1 +
++ 1 file changed, 1 insertion(+)
++
++diff --git a/mt7603/init.c b/mt7603/init.c
++index 10f2ec70..218ec406 100644
++--- a/mt7603/init.c
+++++ b/mt7603/init.c
++@@ -230,6 +230,7 @@ mt7603_mac_init(struct mt7603_dev *dev)
++ 
++ 	eth_broadcast_addr(bc_addr);
++ 	mt7603_wtbl_init(dev, MT7603_WTBL_RESERVED, -1, bc_addr);
+++	mt76_wcid_init(&dev->global_sta.wcid, 0);
++ 	dev->global_sta.wcid.idx = MT7603_WTBL_RESERVED;
++ 	rcu_assign_pointer(dev->mt76.wcid[MT7603_WTBL_RESERVED],
++ 			   &dev->global_sta.wcid);
++-- 
++2.56.0
++
+diff --git a/package/kernel/mt76/patches/0996-wifi-mt76-mt7603-don-t-drop-short-frames-looped-back.patch b/package/kernel/mt76/patches/0996-wifi-mt76-mt7603-don-t-drop-short-frames-looped-back.patch
+new file mode 100644
+index 0000000..90482ba
+--- /dev/null
++++ b/package/kernel/mt76/patches/0996-wifi-mt76-mt7603-don-t-drop-short-frames-looped-back.patch
+@@ -0,0 +1,92 @@
++From e5248f39b0f8a01e801e8e54fca01c9291c766bd Mon Sep 17 00:00:00 2001
++From: Cristian Papa <pcristian292@gmail.com>
++Date: Tue, 22 Sep 2026 19:08:14 -0300
++Subject: [PATCH 996/996] wifi: mt76: mt7603: don't drop short frames looped
++ back on PS entry
++
++When a station enters power save, mt7603 has the PSE redirect the frames
++still queued for it back to the host, and mt7603_rx_loopback_skb() parks
++them until the station wakes up.
++
++The handler rejects every frame shorter than a four-address header
++(sizeof(struct ieee80211_hdr), 30 bytes) before looking at it. A
++BlockAck request is 20 bytes and a QoS-Null 26, so both are freed
++without a trace. Since commit b473c0e47f04 ("wifi: mt76: mt7603: fix tx
++queue of loopback packets"), a BAR would also be freed later as a frame
++that is not a bufferable MMPDU, although mac80211 buffers BARs for a
++sleeping station like any other unicast frame.
++
++mac80211 queues the BAR with IEEE80211_TX_CTL_REQ_TX_STATUS, so it only
++learns about the loss when the tx status times out, and the recipient
++keeps waiting on its reorder window until then.
++
++Check the length against the header length of the actual frame, and
++park a BlockAck request on the queue of its TID, behind the data frames
++it refers to.
++
++Found on a TP-Link Archer XR500v (MT7603E) with a client whose Bluetooth
++coexistence toggles PM every ~15 ms under load. To test the change on
++its own, a temporary debugfs switch flipped between the old and the new
++checks every 30 seconds during a bidirectional TCP test, with counters
++on the loop-back path and on the tx status of BARs. With the old check,
++all 92 BARs that came back were freed, and 91 of the 544 BARs queued in
++those phases never got a tx status from the hardware. With this change,
++all 129 BARs that came back were parked and sent again, and 11 of 411
++got no tx status. Throughput was the same with both checks.
++
++Fixes: e004b7006600 ("mt76: mt7603: notify mac80211 about buffered frames in ps queue")
++Assisted-by: LLM
++Signed-off-by: Cristian Papa <pcristian292@gmail.com>
++Link: https://patch.msgid.link/20260922220814.15070-1-pcristian292@gmail.com
++Signed-off-by: Felix Fietkau <nbd@nbd.name>
++(cherry picked from commit a374cac12909ed038a0997f25615bc2aae525765)
++---
++ mt7603/dma.c | 18 +++++++++++++++++-
++ 1 file changed, 17 insertions(+), 1 deletion(-)
++
++diff --git a/mt7603/dma.c b/mt7603/dma.c
++index 477a9b7a..491c8c93 100644
++--- a/mt7603/dma.c
+++++ b/mt7603/dma.c
++@@ -34,7 +34,7 @@ mt7603_rx_loopback_skb(struct mt7603_dev *dev, struct sk_buff *skb)
++ 	int idx;
++ 	u32 val;
++ 
++-	if (skb->len < MT_TXD_SIZE + sizeof(struct ieee80211_hdr))
+++	if (skb->len < MT_TXD_SIZE + 2)
++ 		goto free;
++ 
++ 	val = le32_to_cpu(txd[1]);
++@@ -52,6 +52,9 @@ mt7603_rx_loopback_skb(struct mt7603_dev *dev, struct sk_buff *skb)
++ 	sta = container_of(priv, struct ieee80211_sta, drv_priv);
++ 	hdr = (struct ieee80211_hdr *)&skb->data[MT_TXD_SIZE];
++ 
+++	if (skb->len < MT_TXD_SIZE + ieee80211_hdrlen(hdr->frame_control))
+++		goto free;
+++
++ 	hwq = wmm_queue_map[IEEE80211_AC_BE];
++ 	if (ieee80211_is_data_qos(hdr->frame_control)) {
++ 		tid = *ieee80211_get_qos_ctl(hdr) &
++@@ -62,6 +65,19 @@ mt7603_rx_loopback_skb(struct mt7603_dev *dev, struct sk_buff *skb)
++ 	} else if (ieee80211_is_data(hdr->frame_control)) {
++ 		skb_set_queue_mapping(skb, IEEE80211_AC_BE);
++ 		hwq = wmm_queue_map[IEEE80211_AC_BE];
+++	} else if (ieee80211_is_back_req(hdr->frame_control)) {
+++		struct ieee80211_bar *bar = (struct ieee80211_bar *)hdr;
+++
+++		if (skb->len < MT_TXD_SIZE + sizeof(*bar))
+++			goto free;
+++
+++		tid = (le16_to_cpu(bar->control) &
+++		       IEEE80211_BAR_CTRL_TID_INFO_MASK) >>
+++		      IEEE80211_BAR_CTRL_TID_INFO_SHIFT;
+++		tid &= IEEE80211_QOS_CTL_TAG1D_MASK;
+++		qid = tid_to_ac[tid];
+++		hwq = wmm_queue_map[qid];
+++		skb_set_queue_mapping(skb, qid);
++ 	} else {
++ 		skb_pull(skb, MT_TXD_SIZE);
++ 		if (!ieee80211_is_bufferable_mmpdu(skb))
++-- 
++2.56.0
++
