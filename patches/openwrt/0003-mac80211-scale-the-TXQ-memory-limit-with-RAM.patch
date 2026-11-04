@@ -1,0 +1,64 @@
+From cba8ff6e77b00e386f25f1df1072f0f79636a57b Mon Sep 17 00:00:00 2001
+From: retake <ysfss@protonmail.com>
+Date: Tue, 3 Nov 2026 12:00:03 +0300
+Subject: [PATCH 3/7] mac80211: scale the TXQ memory limit with RAM
+
+Backport of openwrt/openwrt PR #25733 (not merged yet): cap each
+wiphy's default TXQ memory limit at 1/32 of MemTotal.  The 16 MiB VHT
+default alone can OOM a 64 MiB board (#25722).
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: retake <ysfss@protonmail.com>
+---
+ ...-scale-the-TXQ-memory-limit-with-RAM.patch | 42 +++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+ create mode 100644 package/kernel/mac80211/patches/subsys/306-mac80211-scale-the-TXQ-memory-limit-with-RAM.patch
+
+diff --git a/package/kernel/mac80211/patches/subsys/306-mac80211-scale-the-TXQ-memory-limit-with-RAM.patch b/package/kernel/mac80211/patches/subsys/306-mac80211-scale-the-TXQ-memory-limit-with-RAM.patch
+new file mode 100644
+index 0000000..87128fe
+--- /dev/null
++++ b/package/kernel/mac80211/patches/subsys/306-mac80211-scale-the-TXQ-memory-limit-with-RAM.patch
+@@ -0,0 +1,42 @@
++From 9920fdb5887c6ab45a56d5f9f4b356dd3ce0ebd5 Mon Sep 17 00:00:00 2001
++From: Hsiu-Chi Tsai <hctsai@linux.com>
++Date: Mon, 12 Oct 2026 13:15:00 +0800
++Subject: [PATCH] mac80211: scale the TXQ memory limit with RAM
++
++mac80211 lets the TXQs of a radio hold up to 16 MiB with VHT and 4 MiB
++without. On a board with 64 MiB of RAM that is about all the free memory,
++and a wired-to-Wi-Fi flood can run it out of memory.
++
++Cap the default limit of each wiphy at 1/32 of totalram_pages(), the
++MemTotal of /proc/meminfo, so that two wiphys with the default limit stay
++within 1/16 together. VHT radios keep 16 MiB from 512 MiB of MemTotal up,
++and other radios keep 4 MiB from 128 MiB up. A limit the driver sets in
++wiphy->txq_memory_limit still takes precedence.
++
++Signed-off-by: Hsiu-Chi Tsai <hctsai@linux.com>
++---
++ net/mac80211/tx.c | 6 ++++++
++ 1 file changed, 6 insertions(+)
++
++--- a/net/mac80211/tx.c
+++++ b/net/mac80211/tx.c
++@@ -1593,6 +1593,7 @@ int ieee80211_txq_setup_flows(struct iee
++ 	int i;
++ 	bool supp_vht = false;
++ 	enum nl80211_band band;
+++	u64 limit;
++ 
++ 	ret = fq_init(fq, 4096);
++ 	if (ret)
++@@ -1615,6 +1616,11 @@ int ieee80211_txq_setup_flows(struct iee
++ 	if (!supp_vht)
++ 		fq->memory_limit = 4 << 20; /* 4 Mbytes */
++ 
+++	/* Keep the queues within 1/32 of RAM on small systems. */
+++	limit = (u64)totalram_pages() * PAGE_SIZE / 32;
+++	if (limit < fq->memory_limit)
+++		fq->memory_limit = limit;
+++
++ 	codel_params_init(&local->cparams);
++ 	local->cparams.interval = MS2TIME(100);
++ 	local->cparams.target = MS2TIME(20);
