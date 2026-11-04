@@ -46,7 +46,12 @@ alone gave 12 MB back.
 
 Configure the active position on the usual LuCI pages; every saved change is
 kept for that position.  *System → Mode Switch* shows all positions, applies
-them, and edits the inactive ones.  See [feed/README.md](feed/README.md).
+them, and edits the inactive ones.
+
+![Mode Switch page](docs/img/modeswitch.png)
+
+How to use it: [docs/guide.md](docs/guide.md).  How it works:
+[feed/README.md](feed/README.md).
 
 ## Build
 
