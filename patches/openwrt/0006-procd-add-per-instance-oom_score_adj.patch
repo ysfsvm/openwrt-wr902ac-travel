@@ -1,0 +1,146 @@
+From 92af7cb0fa559d47e3caa7e045009923c91b3b13 Mon Sep 17 00:00:00 2001
+From: retake <ysfss@protonmail.com>
+Date: Tue, 3 Nov 2026 12:00:06 +0300
+Subject: [PATCH 6/7] procd: add per-instance oom_score_adj
+
+Add a procd patch so that init scripts can set the OOM score of an
+instance:
+
+  procd_set_param oom_score_adj <-1000..1000>
+
+procd writes the value to /proc/self/oom_score_adj in the child, before
+it drops privileges, so unprivileged services can be protected as well.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: retake <ysfss@protonmail.com>
+---
+ package/system/procd/files/procd.sh           |   2 +-
+ .../100-instance-add-oom_score_adj.patch      | 106 ++++++++++++++++++
+ 2 files changed, 107 insertions(+), 1 deletion(-)
+ create mode 100644 package/system/procd/patches/100-instance-add-oom_score_adj.patch
+
+diff --git a/package/system/procd/files/procd.sh b/package/system/procd/files/procd.sh
+index 03b0336..53e87ea 100644
+--- a/package/system/procd/files/procd.sh
++++ b/package/system/procd/files/procd.sh
+@@ -257,7 +257,7 @@ _procd_set_param() {
+ 			json_add_string "" "$@"
+ 			json_close_array
+ 		;;
+-		nice|term_timeout)
++		nice|term_timeout|oom_score_adj)
+ 			json_add_int "$type" "$1"
+ 		;;
+ 		reload_signal)
+diff --git a/package/system/procd/patches/100-instance-add-oom_score_adj.patch b/package/system/procd/patches/100-instance-add-oom_score_adj.patch
+new file mode 100644
+index 0000000..cb23b9c
+--- /dev/null
++++ b/package/system/procd/patches/100-instance-add-oom_score_adj.patch
+@@ -0,0 +1,106 @@
++From: retake <ysfss@protonmail.com>
++Subject: [PATCH] instance: add oom_score_adj parameter
++
++Lets init scripts set the OOM killer score of a service instance with
++"procd_set_param oom_score_adj <-1000..1000>".  It is written to
++/proc/self/oom_score_adj in the child, before privileges are dropped,
++so jailed and unprivileged services inherit it too.
++
++Assisted-by: Claude:claude-opus-5-5
++Signed-off-by: retake <ysfss@protonmail.com>
++---
++diff --git a/service/instance.c b/service/instance.c
++index 51d85b0..f1bcf39 100644
++--- a/service/instance.c
+++++ b/service/instance.c
++@@ -71,6 +71,7 @@ enum {
++ 	INSTANCE_ATTR_TMPOVERLAYSIZE,
++ 	INSTANCE_ATTR_BUNDLE,
++ 	INSTANCE_ATTR_WATCHDOG,
+++	INSTANCE_ATTR_OOM_SCORE_ADJ,
++ 	__INSTANCE_ATTR_MAX
++ };
++ 
++@@ -104,6 +105,7 @@ static const struct blobmsg_policy instance_attr[__INSTANCE_ATTR_MAX] = {
++ 	[INSTANCE_ATTR_TMPOVERLAYSIZE] = { "tmpoverlaysize", BLOBMSG_TYPE_STRING },
++ 	[INSTANCE_ATTR_BUNDLE] = { "bundle", BLOBMSG_TYPE_STRING },
++ 	[INSTANCE_ATTR_WATCHDOG] = { "watchdog", BLOBMSG_TYPE_ARRAY },
+++	[INSTANCE_ATTR_OOM_SCORE_ADJ] = { "oom_score_adj", BLOBMSG_TYPE_INT32 },
++ };
++ 
++ enum {
++@@ -479,6 +481,16 @@ instance_run(struct service_instance *in, int _stdout, int _stderr)
++ 	if (in->nice)
++ 		setpriority(PRIO_PROCESS, 0, in->nice);
++ 
+++	/* before dropping privileges: lowering the score needs CAP_SYS_RESOURCE */
+++	if (in->has_oom_score_adj) {
+++		FILE *f = fopen("/proc/self/oom_score_adj", "w");
+++
+++		if (!f || fprintf(f, "%d\n", in->oom_score_adj) < 0)
+++			ERROR("failed to set oom_score_adj for %s: %m\n", in->name);
+++		if (f)
+++			fclose(f);
+++	}
+++
++ 	blobmsg_for_each_attr(cur, in->command, rem)
++ 		argc++;
++ 
++@@ -974,6 +986,10 @@ instance_config_changed(struct service_instance *in, struct service_instance *in
++ 	if (in->nice != in_new->nice)
++ 		return true;
++ 
+++	if (in->has_oom_score_adj != in_new->has_oom_score_adj ||
+++	    in->oom_score_adj != in_new->oom_score_adj)
+++		return true;
+++
++ 	if (in->syslog_facility != in_new->syslog_facility)
++ 		return true;
++ 
++@@ -1351,6 +1367,15 @@ instance_config_parse(struct service_instance *in)
++ 			return false;
++ 	}
++ 
+++	if ((cur = tb[INSTANCE_ATTR_OOM_SCORE_ADJ])) {
+++		int32_t adj = (int32_t) blobmsg_get_u32(cur);
+++
+++		if (adj < -1000 || adj > 1000)
+++			return false;
+++		in->oom_score_adj = adj;
+++		in->has_oom_score_adj = true;
+++	}
+++
++ 	if (tb[INSTANCE_ATTR_USER]) {
++ 		const char *user = blobmsg_get_string(tb[INSTANCE_ATTR_USER]);
++ 		struct passwd *p = getpwnam(user);
++@@ -1537,6 +1562,8 @@ instance_config_move(struct service_instance *in, struct service_instance *in_sr
++ 	}
++ 	in->name = in_src->name;
++ 	in->nice = in_src->nice;
+++	in->oom_score_adj = in_src->oom_score_adj;
+++	in->has_oom_score_adj = in_src->has_oom_score_adj;
++ 	in->trace = in_src->trace;
++ 	in->node.avl.key = in_src->node.avl.key;
++ 	in->syslog_facility = in_src->syslog_facility;
++@@ -1681,6 +1708,8 @@ void instance_dump(struct blob_buf *b, struct service_instance *in, int verbose)
++ 	if (in->bundle)
++ 		blobmsg_add_string(b, "bundle", in->bundle);
++ 	blobmsg_add_u32(b, "term_timeout", in->term_timeout);
+++	if (in->has_oom_score_adj)
+++		blobmsg_add_u32(b, "oom_score_adj", in->oom_score_adj);
++ 	if (!in->proc.pending)
++ 		blobmsg_add_u32(b, "exit_code", in->exit_code);
++ 
++diff --git a/service/instance.h b/service/instance.h
++index 1d0fcc2..7155c48 100644
++--- a/service/instance.h
+++++ b/service/instance.h
++@@ -67,6 +67,8 @@ struct service_instance {
++ 	const char *name;
++ 
++ 	int8_t nice;
+++	int16_t oom_score_adj;
+++	bool has_oom_score_adj;
++ 	bool valid;
++ 
++ 	char *user;
