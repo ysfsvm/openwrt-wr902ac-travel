@@ -1,0 +1,7 @@
+#!/bin/sh
+# slide-switch emits BUTTON=mode-<position>; only presses matter: modectl
+# tracks the active mode itself, so a switch moved while powered off is
+# handled by the press slide-switch triggers at boot.
+[ "$ACTION" = pressed ] || exit 0
+case "$BUTTON" in mode-*) ;; *) exit 0 ;; esac
+/usr/sbin/modectl handle "${BUTTON#mode-}" </dev/null >/dev/null 2>&1 &

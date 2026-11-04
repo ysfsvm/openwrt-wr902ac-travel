@@ -1,0 +1,385 @@
+#!/bin/sh
+# modectl - one config profile per position of the hardware mode switch
+#
+# Modes are the switch positions themselves (slide-switch names, e.g.
+# share-eth, ap, share-hotspot). Each owns a copy of the "mode files"
+# (network, wireless, firewall, dhcp by default) in /etc/modes/<position>/.
+#
+#  - The running config is the truth: every committed change to a mode file
+#    (LuCI save & apply, uci commit + reload_config) is saved into the active
+#    position's profile by a procd config trigger ("modectl save").
+#  - Moving the switch saves the active profile and loads the target one;
+#    procd applies it (reload_config).
+#  - Another position's profile can be edited directly ("modectl put",
+#    LuCI editor); a profile that does not exist yet is built once from
+#    /etc/modeswitch/defaults/<position>.sh.
+# Global configs (system, uhttpd, dropbear, ...) are never touched.
+
+MODES_DIR=/etc/modes
+DEFAULTS_DIR=/etc/modeswitch/defaults
+LOCK=/var/lock/modeswitch.lock
+SWITCH=mode
+
+log() { logger -t modeswitch -- "$*"; [ -t 2 ] && echo "modeswitch: $*" >&2; return 0; }
+die() { log "error: $*"; echo "error: $*" >&2; lock -u "$LOCK" 2>/dev/null; exit 1; }
+
+sect() { echo "$1" | tr -c 'a-zA-Z0-9_\n' '_'; }        # position -> uci section
+popt() { uci -q get "modeswitch.$(sect "$1").$2"; }     # popt <position> <option>
+mode_files() { uci -q get modeswitch.main.files || echo "network wireless firewall dhcp"; }
+modes() { uci -q show modeswitch | sed -n "s/^modeswitch\.\([^.=]*\)=position$/\1/p" | while read -r s; do uci -q get "modeswitch.$s.name"; done; }
+is_mode() { [ -n "$1" ] && [ "$(uci -q get "modeswitch.$(sect "$1")")" = position ]; }
+is_mode_file() { local f; for f in $(mode_files); do [ "$f" = "$1" ] && return 0; done; return 1; }
+current() { cat "$MODES_DIR/current" 2>/dev/null; }
+lc() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+label_of() { [ -n "$1" ] && echo "$(dname "$1") [$1]" || echo "${2:-none}"; }   # "Home [share-eth]"
+dname() { local a; a="$(popt "$1" alias)"; echo "${a:-$1}"; }   # display name: alias or position
+resolve() { # position or alias (case-insensitive) -> position
+	local m
+	is_mode "$1" && { echo "$1"; return 0; }
+	for m in $(modes); do
+		[ -n "$1" ] && [ "$(lc "$(popt "$m" alias)")" = "$(lc "$1")" ] && { echo "$m"; return 0; }
+	done
+	return 1
+}
+position() { slide-switch position "$SWITCH" 2>/dev/null; }
+
+# the wired port as defined by the board (eth0.1 on MT76x8: the switch CPU port is tagged)
+WIRED="$(jsonfilter -q -i /etc/board.json -e '@.network.lan.device' 2>/dev/null)"; WIRED="${WIRED:-eth0}"
+ROLLBACK_DIR=/var/run/rpcd/snapshot-files   # non-empty while a LuCI apply waits for confirmation
+ROLE_WAIT=/var/run/modeswitch-role-wait
+following() { [ "$(uci -q get modeswitch.main.enabled)" != 0 ]; }
+
+# put_conf <src> <dst>: replace dst atomically (copy next to it, then rename),
+# so a power cut never leaves a half-written config on flash
+put_conf() { cp -p "$1" "$2.new.$$" && mv -f "$2.new.$$" "$2"; }
+
+drop_pending() {
+	local f
+	for f in $(mode_files); do
+		[ -n "$(uci changes "$f" 2>/dev/null)" ] || continue
+		log "discarding uncommitted changes in '$f'"
+		uci revert "$f"
+	done
+}
+
+save_profile() { # $1=position
+	local f
+	mkdir -p "$MODES_DIR/$1"
+	for f in $(mode_files); do
+		[ -f "/etc/config/$f" ] && put_conf "/etc/config/$f" "$MODES_DIR/$1/$f"
+	done
+	date +%s > "$MODES_DIR/$1/.saved"
+}
+
+generate_profile() { # $1=position: build a missing profile from its defaults template
+	local m="$1" gen=/tmp/modeswitch-gen.$$ base="$MODES_DIR/_initial" f rc
+	[ -f "$DEFAULTS_DIR/$m.sh" ] || die "no profile and no defaults template for '$m'"
+	[ -d "$base" ] || base=/etc/config
+	rm -rf "$gen"; mkdir -p "$gen/.delta"
+	for f in $(mode_files); do
+		[ -f "$base/$f" ] && cp "$base/$f" "$gen/$f" || : > "$gen/$f"
+	done
+	# private change dir (-t): template edits must never leak into /tmp/.uci.
+	# Runtime failures are expected; a template that cannot be sourced or that
+	# exits non-zero (e.g. missing settings) aborts the generation.
+	# shellcheck disable=SC1090,SC1091,SC2034 # UCI and MODE are for the template
+	( UCI="uci -q -c $gen -t $gen/.delta"; MODE="$m"; . /usr/share/modeswitch/lib.sh; . "$DEFAULTS_DIR/$m.sh"; exit 0 ); rc=$?
+	[ $rc -eq 0 ] || { rm -rf "$gen"; die "defaults template for '$m' failed ($rc)"; }
+	for f in $(mode_files); do uci -q -c "$gen" -t "$gen/.delta" commit "$f"; done
+	mkdir -p "$MODES_DIR/$m"
+	for f in $(mode_files); do put_conf "$gen/$f" "$MODES_DIR/$m/$f"; done
+	date +%s > "$MODES_DIR/$m/.generated"
+	rm -rf "$gen"
+	log "generated profile '$m' from defaults"
+}
+
+load_profile() { # $1=position
+	local f
+	for f in $(mode_files); do
+		[ -f "$MODES_DIR/$1/$f" ] && put_conf "$MODES_DIR/$1/$f" "/etc/config/$f"
+	done
+}
+
+switch_to() { # $1=position $2=reason
+	local m="$1" cur
+	is_mode "$m" || die "unknown position '$m'"
+	lock "$LOCK"
+	cur="$(current)"
+	if [ "$cur" = "$m" ]; then
+		lock -u "$LOCK"; log "already in $(dname "$m") [$m] ($2)"; return 0
+	fi
+	drop_pending
+	if [ -n "$cur" ] && is_mode "$cur"; then
+		save_profile "$cur"
+	elif [ ! -d "$MODES_DIR/_initial" ]; then
+		save_profile _initial   # first run: keep the pre-modeswitch config
+	fi
+	[ -d "$MODES_DIR/$m" ] || generate_profile "$m"
+	load_profile "$m"
+	echo "$m" > "$MODES_DIR/current"
+	sync_wired_role noreload
+	sync
+	lock -u "$LOCK"
+	log "switched $(label_of "$cur" "<none>") -> $(label_of "$m") ($2)"
+	reload_config
+}
+
+# --- wired port role (positions with "option wired_role auto") -----------
+# The wired port is LAN (in br-lan) while a Wi-Fi uplink is configured (an
+# enabled STA, e.g. from LuCI Scan -> Join) and the uplink (wan) otherwise.
+# Decided by configuration only, never by link state, so it does not flap.
+
+wifi_uplink() { # an enabled STA on an enabled radio
+	local i r
+	for i in $(uci -q show wireless | sed -n "s/^wireless\.\([^.]*\)=wifi-iface$/\1/p"); do
+		[ "$(uci -q get "wireless.$i.mode")" = sta ] || continue
+		[ "$(uci -q get "wireless.$i.disabled")" = 1 ] && continue
+		r="$(uci -q get "wireless.$i.device")"
+		[ "$(uci -q get "wireless.$r.disabled")" = 1 ] && continue
+		return 0
+	done
+	return 1
+}
+
+lan_bridge() { uci -q -X show network | sed -n "s/^network\.\([^.]*\)\.name='br-lan'$/\1/p" | head -n1; }
+
+wired_role() { # lan or wan: where the wired port is now
+	echo " $(uci -q get "network.$(lan_bridge).ports") " | grep -q " $WIRED " && echo lan || echo wan
+}
+
+sync_wired_role() { # [noreload]
+	local want d
+	[ "$(popt "$(current)" wired_role)" = auto ] || return 0
+	[ -n "$(uci -q get network.wan)" ] && d="$(lan_bridge)" && [ -n "$d" ] || return 0
+	if [ -n "$(ls -A "$ROLLBACK_DIR" 2>/dev/null)" ]; then
+		# A LuCI apply is waiting for its confirmation. Moving the port now
+		# could cut the browser off and roll the Wi-Fi change back, so wait
+		# until it was confirmed (or rolled back) and decide then.
+		mkdir "$ROLE_WAIT" 2>/dev/null || return 0
+		( i=0
+		  while [ -n "$(ls -A "$ROLLBACK_DIR" 2>/dev/null)" ] && [ $i -lt 300 ]; do sleep 2; i=$((i + 2)); done
+		  rmdir "$ROLE_WAIT"; exec /usr/sbin/modectl wired-role ) </dev/null >/dev/null 2>&1 &
+		return 0
+	fi
+	want=wan; wifi_uplink && want=lan
+	[ "$want" = "$(wired_role)" ] && return 0
+	if [ -n "$(uci -q changes network)" ]; then
+		log "wired port ($WIRED) should be $want, but network has uncommitted changes; left as is"
+		return 0
+	fi
+	if [ "$want" = lan ]; then
+		uci add_list "network.$d.ports=$WIRED"; uci -q delete "network.$d.bridge_empty"
+		uci set network.wan.disabled=1
+		log "wired port ($WIRED) is LAN now: a Wi-Fi uplink is configured"
+	else
+		uci -q del_list "network.$d.ports=$WIRED"; uci set "network.$d.bridge_empty=1"
+		uci -q delete network.wan.disabled
+		log "wired port ($WIRED) is the uplink now: no Wi-Fi uplink configured"
+	fi
+	uci commit network
+	[ "$1" = noreload ] || reload_config
+}
+
+EDIT_DIR=/tmp/modeswitch-edit   # LuCI uploads edited files here
+drop_upload() { case "$1" in "$EDIT_DIR"/*) rm -f "$1" ;; esac; }
+
+put_file() { # put <position> <file> <path>: replace one file of a profile (validated)
+	local m="$1" f="$2" src="$3" chk=/tmp/modeswitch-chk.$$
+	is_mode "$m" || die "unknown position '$m'"
+	is_mode_file "$f" || die "'$f' is not a mode file"
+	[ -f "$src" ] || die "no such file: $src"
+	rm -rf "$chk"; mkdir -p "$chk/.delta"; cp "$src" "$chk/$f"
+	if ! uci -c "$chk" -t "$chk/.delta" show "$f" >/dev/null 2>"$chk/err"; then
+		local e; e="$(cat "$chk/err")"; rm -rf "$chk"; drop_upload "$src"; die "invalid uci syntax in '$f': $e"
+	fi
+	rm -rf "$chk"
+	lock "$LOCK"
+	mkdir -p "$MODES_DIR/$m"
+	put_conf "$src" "$MODES_DIR/$m/$f"
+	drop_upload "$src"
+	date +%s > "$MODES_DIR/$m/.saved"
+	if [ "$(current)" = "$m" ]; then
+		drop_pending
+		put_conf "$MODES_DIR/$m/$f" "/etc/config/$f"
+		sync; lock -u "$LOCK"
+		log "updated '$f' of active position '$m'; applying"
+		reload_config
+	else
+		sync; lock -u "$LOCK"
+		log "updated '$f' of position '$m'"
+	fi
+}
+
+summary_json() { # $1=position: what its profile does (no secrets)
+	local d="$MODES_DIR/$1" U i a r dev dhcp=0 vlans
+	[ -d "$d" ] || return 0
+	U="uci -q -c $d"
+	json_add_object summary
+	json_add_array addresses
+	for i in $($U show network | sed -n "s/^network\.\([^.]*\)=interface$/\1/p"); do
+		case "$i" in loopback|wan|wan6|wwan) continue ;; esac
+		case "$($U get "network.$i.proto")" in
+			static) for a in $($U get "network.$i.ipaddr"); do json_add_string "" "$a"; done ;;
+			dhcp)   json_add_string "" "DHCP client" ;;
+		esac
+	done
+	json_close_array
+	dev="$($U get network.wan.device)"
+	[ -n "$dev" ] && json_add_string wan "$dev"
+	[ "$(popt "$1" wired_role)" = auto ] && json_add_string wired_role auto
+	json_add_array ssids
+	for i in $($U show wireless | sed -n "s/^wireless\.\([^.]*\)=wifi-iface$/\1/p"); do
+		[ "$($U get "wireless.$i.disabled")" = 1 ] && continue
+		[ "$($U get "wireless.$i.mode")" = ap ] || continue
+		r="$($U get "wireless.$i.device")"
+		[ "$($U get "wireless.$r.disabled")" = 1 ] && continue
+		json_add_string "" "$($U get "wireless.$i.ssid")"
+	done
+	json_close_array
+	for i in $($U show dhcp | sed -n "s/^dhcp\.\([^.]*\)=dhcp$/\1/p"); do
+		[ "$($U get "dhcp.$i.ignore")" = 1 ] && continue
+		a="$($U get "dhcp.$i.interface")"
+		[ -n "$a" ] && [ -n "$($U get "network.$a")" ] && [ "$a" != wan ] && dhcp=1
+	done
+	json_add_boolean dhcp "$dhcp"
+	# more than one switch VLAN: a trunk
+	vlans="$($U show network | sed -n "s/^network\.@switch_vlan\[[0-9]*\]\.vlan='\(.*\)'$/\1/p")"
+	[ "$(echo "$vlans" | wc -l)" -gt 1 ] && json_add_string vlans "$(echo "$vlans" | tr '\n' ' ' | sed 's/ $//')"
+	json_close_object
+}
+
+uplink_json() { # live state of the active position's uplink: wan if enabled, else wwan
+	local i st dev
+	for i in wan wwan; do
+		[ -n "$(uci -q get "network.$i")" ] || continue
+		[ "$(uci -q get "network.$i.disabled")" = 1 ] && continue
+		st="$(ifstatus "$i" 2>/dev/null)" || continue
+		dev="$(echo "$st" | jsonfilter -e '@.l3_device')"
+		[ "$i" = wwan ] && dev="${dev:-Wi-Fi}"
+		json_add_object uplink
+		json_add_string iface "$i"
+		json_add_string device "${dev:-$(uci -q get "network.$i.device")}"
+		json_add_boolean up "$( [ "$(echo "$st" | jsonfilter -e '@.up')" = true ] && echo 1 || echo 0)"
+		json_add_string address "$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].address')"
+		json_add_string gateway "$(echo "$st" | jsonfilter -e '@.route[0].nexthop')"
+		json_close_object
+		return 0
+	done
+}
+
+json_status() {
+	# shellcheck disable=SC1091
+	. /usr/share/libubox/jshn.sh
+	[ -d "$EDIT_DIR" ] || mkdir -m 0700 "$EDIT_DIR"
+	local m pos cur f
+	pos="$(position)"; cur="$(current)"
+	json_init
+	json_add_string position "$pos"
+	json_add_string position_alias "$(dname "$pos")"
+	json_add_string current "$cur"
+	json_add_string current_alias "$(dname "$cur")"
+	json_add_boolean follow_switch "$(following && echo 1 || echo 0)"
+	json_add_boolean pending "$(for f in $(mode_files); do uci changes "$f"; done 2>/dev/null | grep -q . && echo 1 || echo 0)"
+	json_add_array files
+	for f in $(mode_files); do json_add_string "" "$f"; done
+	json_close_array
+	json_add_array modes
+	for m in $(modes); do
+		json_add_object
+		json_add_string name "$m"
+		json_add_string alias "$(popt "$m" alias)"
+		json_add_string label "$(popt "$m" label)"
+		json_add_string description "$(popt "$m" description)"
+		json_add_boolean active "$( [ "$m" = "$cur" ] && echo 1 || echo 0)"
+		json_add_boolean switch_here "$( [ "$m" = "$pos" ] && echo 1 || echo 0)"
+		json_add_boolean has_profile "$( [ -d "$MODES_DIR/$m" ] && echo 1 || echo 0)"
+		json_add_boolean has_defaults "$( [ -f "$DEFAULTS_DIR/$m.sh" ] && echo 1 || echo 0)"
+		json_add_string saved "$(cat "$MODES_DIR/$m/.saved" 2>/dev/null)"
+		json_add_string generated "$(cat "$MODES_DIR/$m/.generated" 2>/dev/null)"
+		summary_json "$m"
+		json_close_object
+	done
+	json_close_array
+	uplink_json
+	json_dump
+}
+
+usage() {
+	cat <<EOF
+Usage: modectl <command> [args]
+  status [--json]            switch position, active position, profiles
+  brief                      one-line JSON: switch position, active position, follow
+  apply <position>           switch to <position> now (until the switch moves or next boot)
+  save                       store the running mode files in the active position's profile
+                             (runs automatically after every config change)
+  put <position> <file> <path>
+                             replace <file> of <position>'s profile with <path> (syntax
+                             checked); applied right away if <position> is active
+  reset <position>           rebuild <position>'s profile from its defaults template now
+                             (applied right away if <position> is active)
+  set-base                   use the running config as the base for defaults templates
+  follow on|off              follow the hardware switch, or ignore it
+  wired-role                 positions with wired_role=auto: make the wired port LAN if a
+                             Wi-Fi uplink is configured, the uplink otherwise (automatic)
+  handle <position>          called by the button hotplug hook
+Positions (alias = position): $(for m in $(modes); do printf '%s=%s ' "$(dname "$m")" "$m"; done)
+<position> may be given as the position name or its alias.
+Mode files: $(mode_files)
+EOF
+}
+
+case "$1" in
+	brief)  # cheap one-line JSON for the LuCI header indicator
+		p="$(position)"; c="$(current)"
+		printf '{"position":"%s","position_alias":"%s","current":"%s","current_alias":"%s","follow":%s}\n' \
+			"$p" "$(dname "$p")" "$c" "$(dname "$c")" "$(following && echo true || echo false)" ;;
+	status)
+		if [ "$2" = "--json" ]; then json_status; exit 0; fi
+		p="$(position)"; c="$(current)"
+		echo "switch position : $(label_of "$p" "?")"
+		echo "active position : $(label_of "$c" "none")"
+		echo "follow switch   : $(following && echo on || echo off)"
+		for m in $(modes); do
+			printf '  %-8s %-14s %-16s %s\n' "$(dname "$m")" "$m" "$(popt "$m" label)" "$( [ -d "$MODES_DIR/$m" ] && echo profile || echo 'not built yet')"
+		done ;;
+	apply)  [ -n "$2" ] || { usage; exit 2; }; m="$(resolve "$2")" || die "unknown position or alias '$2'"; switch_to "$m" manual ;;
+	save)
+		cur="$(current)"; is_mode "$cur" || exit 0
+		changed=
+		for f in $(mode_files); do
+			cmp -s "/etc/config/$f" "$MODES_DIR/$cur/$f" || changed="$changed $f"
+		done
+		if [ -n "$changed" ]; then   # triggers also fire for our own reloads
+			lock "$LOCK"; save_profile "$cur"; lock -u "$LOCK"; log "saved running config into '$cur' ($changed )"
+		fi
+		lock "$LOCK"; sync_wired_role; lock -u "$LOCK" ;;
+	wired-role) lock "$LOCK"; sync_wired_role; lock -u "$LOCK" ;;
+	put)    [ $# -eq 4 ] || { usage; exit 2; }; m="$(resolve "$2")" || die "unknown position or alias '$2'"; put_file "$m" "$3" "$4" ;;
+	reset)
+		m="$(resolve "$2")" || die "unknown position or alias '$2'"
+		lock "$LOCK"
+		# keep the old profile until the template succeeded
+		old="$MODES_DIR/.reset.$m"; rm -rf "$old"
+		[ -d "$MODES_DIR/$m" ] && mv "$MODES_DIR/$m" "$old"
+		if ! ( generate_profile "$m" ); then
+			rm -rf "${MODES_DIR:?}/${m:?}"; [ -d "$old" ] && mv "$old" "$MODES_DIR/$m"
+			die "reset of '$m' failed; its profile is unchanged"
+		fi
+		rm -rf "$old"
+		if [ "$(current)" = "$m" ]; then
+			drop_pending; load_profile "$m"; lock -u "$LOCK"; log "reset $(dname "$m") [$m] to defaults; applying"; reload_config
+		else
+			lock -u "$LOCK"; log "reset $(dname "$m") [$m] to defaults"
+		fi ;;
+	set-base)
+		lock "$LOCK"; rm -rf "$MODES_DIR/_initial"; save_profile _initial; lock -u "$LOCK"
+		log "base for defaults updated from the running config" ;;
+	follow)
+		case "$2" in on) v=1 ;; off) v=0 ;; *) usage; exit 2 ;; esac
+		uci set modeswitch.main.enabled="$v"; uci commit modeswitch; log "follow switch: $2" ;;
+	handle)
+		following || { log "switch moved to '$2' but follow switch is off"; exit 0; }
+		is_mode "$2" || { log "no profile config for position '$2'"; exit 0; }
+		switch_to "$2" "switch" ;;
+	*) usage; exit 2 ;;
+esac

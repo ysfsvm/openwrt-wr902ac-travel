@@ -1,0 +1,13 @@
+#!/bin/sh
+# 2.3.0: the AP position (share-hotspot) is the travel router now. Its wired
+# port is the uplink unless a Wi-Fi uplink is configured (wired_role auto).
+# /etc/config/modeswitch is kept over sysupgrade, so add the option here.
+# An existing AP profile is left alone: modectl only moves the port once the
+# profile has a wan interface, i.e. after "modectl reset share-hotspot" (LuCI:
+# Mode Switch -> AP -> Reset).
+[ "$(uci -q get modeswitch.share_hotspot)" = position ] || exit 0
+[ -n "$(uci -q get modeswitch.share_hotspot.wired_role)" ] && exit 0
+uci set modeswitch.share_hotspot.wired_role=auto
+uci set modeswitch.share_hotspot.description='Travel router: Wi-Fi AP with its own LAN 192.168.50.1/24 and DHCP. Uplink is the wired port, or a Wi-Fi joined in LuCI (Scan, Join), in which case the wired port is LAN. NAT; captive-portal friendly (DNS rebind protection off).'
+uci commit modeswitch
+exit 0

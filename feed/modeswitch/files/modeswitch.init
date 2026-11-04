@@ -1,0 +1,19 @@
+#!/bin/sh /etc/rc.common
+# Saves every committed change of a mode file (LuCI save & apply, or
+# uci commit + reload_config) into the active position's profile.
+
+# shellcheck disable=SC2034 # used by rc.common
+START=99
+# shellcheck disable=SC2034
+USE_PROCD=1
+
+start_service() {
+	[ -d /tmp/modeswitch-edit ] || mkdir -m 0700 /tmp/modeswitch-edit   # LuCI editor uploads
+}
+
+service_triggers() {
+	local f
+	for f in $(uci -q get modeswitch.main.files || echo "network wireless firewall dhcp"); do
+		procd_add_config_trigger "config.change" "$f" /usr/sbin/modectl save
+	done
+}
