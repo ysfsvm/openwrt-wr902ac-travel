@@ -1,0 +1,4 @@
+#!/bin/sh
+# 64 MB boards: cap each wiphy's TXQ at 2 MiB (default is 4 MiB for 11n, 16 MiB for 11ac)
+[ "$ACTION" = add ] || exit 0
+iw phy "$DEVICENAME" set txq memory_limit 2097152 2>/dev/null
